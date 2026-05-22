@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ah_cache::AhCache;
 use super::device::IbDevice;
+use super::rdma_buf::RdmaBufPool;
 use super::socket::{CqPump, IbSocket};
 use crate::rpc::Response;
 
@@ -41,6 +42,8 @@ pub struct RdmaConfig {
     pub dc_key:       u64,
     pub qos:          RdmaQos,
     pub peers:        Vec<PeerEndpoint>,
+    pub bulk_buf_size: usize,
+    pub bulk_pool_cap: usize,
 }
 
 pub struct RdmaNode {
@@ -52,6 +55,7 @@ pub struct RdmaNode {
     pub pump:              CqPump,
     pub next_request_id:   Cell<u64>,
     pub pending_responses: RefCell<HashMap<u64, oneshot::Sender<Response>>>,
+    pub bulk_pool:         Rc<RdmaBufPool>,
 }
 
 impl RdmaNode {
@@ -74,10 +78,12 @@ impl RdmaNode {
             }
             peers.insert(p.node_id, p);
         }
+        let bulk_pool = RdmaBufPool::new(dev.pd.as_ptr(), cfg.bulk_pool_cap, cfg.bulk_buf_size);
         Ok(RdmaNode {
             self_id: cfg.self_node_id, dev, sock, ah_cache, peers, pump,
             next_request_id:   Cell::new(1),
             pending_responses: RefCell::new(HashMap::new()),
+            bulk_pool,
         })
     }
 
