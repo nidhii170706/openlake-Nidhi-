@@ -38,8 +38,13 @@ OpenLake is an object store for AI infrastructure. Training and inference cluste
  - **No kernel involvement.** GPUDirect Storage and RDMA, data moves from peer NIC into GPU VRAM zerocopy, eliminating host memory and the page cache. see [Architecture](https://github.com/openlake-project/openlake#quickstart).
  - **Erasure coded.** SIMD Reed Solomon across striped EC. Reduced storage cost for replication, high throughput without the CPU cost of conventional EC.
  - **PacedRDMA.** Novel congestion control for high throughput RDMA. Pinned credit based memory pool to absorb request bursts, minimizing tail latencies.
- 
-Today OpenLake runs as a standard S3 endpoint you can point any AWS SDK at.
+ <br>
+
+  <p align="center">
+    <img src="docs/get_readme_p50_512.png" width="1400">
+  </p>
+  OpenLake sustains 225 MiB/s GET at sub 10 ms p50, 3x MinIO and 9x RustFS at c=512.
+
 
   ## Quickstart
 
