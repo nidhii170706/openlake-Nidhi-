@@ -14,7 +14,7 @@ The shortest path from NVMe to GPU memory.
 Distributed object storage for GPU workloads. Built on Rust on `io_uring`, OpenLake is a state of the art storage engine delivering 6x throughput and million+ iops within 1ms.
 
 
-[Discord](https://discord.gg/TNXqVSnP6x)&nbsp;·&nbsp;[Website](https://theopenlake.com)&nbsp;·&nbsp;[Comparison](https://theopenlake.com/compare.html)&nbsp;·&nbsp;[Architecture](#architecture)&nbsp;·&nbsp;[Quickstart](#quickstart)
+[Discord](https://discord.gg/TNXqVSnP6x)&nbsp;·&nbsp;[Website](https://theopenlake.com)&nbsp;·&nbsp;[Comparison](https://theopenlake.com/compare.html)&nbsp;·&nbsp;[Architecture](https://github.com/openlake-project/openlake/tree/main/docs)&nbsp;·&nbsp;[Quickstart](#quickstart)
 
 
 
@@ -32,7 +32,7 @@ Distributed object storage for GPU workloads. Built on Rust on `io_uring`, OpenL
 
 ## What is OpenLake?
 
-OpenLake is an object store for AI infrastructure. Training and inference clusters spend a large fraction of their wall clock time moving bytes from storage into GPU memory, most object stores put the host CPU, the page cache, and several userspace copies directly in that path. OpenLake is a high throughput, low latency storage engine that takes the opposite stance.
+OpenLake is an object store for AI infrastructure. Training and inference clusters spend a large fraction of their wall clock time moving bytes from storage into GPU memory, most object stores put the host CPU, the page cache, and several userspace copies directly in that path. OpenLake is a high throughput, low latency storage engine for high throughput GPU workloads.
 
 - **`io_uring`, thread per core.** Built on the [`compio`](https://github.com/compio-rs/compio) completion based runtime. One runtime per core, pinned, no work stealing. The HTTP frontend and the storage engine run on the *same* thread, so a request never crosses a core boundary on the hot path.
  - **No kernel involvement.** GPUDirect Storage and RDMA, data moves from peer NIC into GPU VRAM zerocopy, eliminating host memory and the page cache. see [Architecture](https://github.com/openlake-project/openlake#quickstart).
