@@ -3,7 +3,7 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/openlake-project/openlake/refs/heads/main/assets/openlake-wordmark-dark-8192.png">
-  <img alt="OpenLake" src="https://github.com/user-attachments/assets/ce60d755-6e5e-46a4-b5a6-e40af534a0ba" width=60%>
+  <img alt="OpenLake" src="https://raw.githubusercontent.com/openlake-project/openlake/refs/heads/main/assets/openlake-logo-wide.png" width=60%>
 </picture>
 
 <h3 align="center">
