@@ -47,8 +47,8 @@ Learn more: [Blogs →](https://cloud.theopenlake.com/blog) | [Benchmarks →](h
 
 <br>
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/251ef5e9-5f46-42ee-9ea5-18395f5a8979" width="49%">
-  <img src="https://github.com/user-attachments/assets/ec8e2fe7-8c3e-48d6-9f98-d5076273a47c" width="49%">
+  <img src="https://raw.githubusercontent.com/openlake-project/openlake/main/assets/ttft-recompute.png" width="49%">
+  <img src="https://raw.githubusercontent.com/openlake-project/openlake/main/assets/total-gpu-sec.png" width="49%">
 </p>
 <p align="center"><sub>66× speedup on time to first token first token when cached. (128K context window)</sub></p>
 
@@ -80,7 +80,7 @@ Note: By default OpenLake offloads to the same host. To enable OpenLake across y
 
 OpenLake enabled vs disabled:
 
-<img width="1914" height="720" alt="openlake-video" src="https://github.com/user-attachments/assets/4743ee40-e662-4045-9002-66c9a5e50132" />
+<img width="1914" height="720" alt="openlake-video" src="https://raw.githubusercontent.com/openlake-project/openlake/main/assets/openlake-perf.gif" />
 <p align="center"><sub>OpenLake and vLLM serving Gemma4-31B on H100 (256K context window)</sub></p>
 
 <details>
