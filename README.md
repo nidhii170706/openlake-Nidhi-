@@ -58,7 +58,7 @@ GPU nodes contribute to create an OpenLake cluster. The inference engine writes 
 
 ## Quickstart:
 
-### 1) Convert your GPU nodes into infinite KV pool:
+### 1) Setup KV Pool on GPU nodes:
 
 Drop OpenLake into your existing setup. No code changes:
 
@@ -119,7 +119,7 @@ A prefix computed on one GPU host is served to any other from the shared pool.
 
 </details>
 
-### 2) PB scale object store for your GPU Fleet
+### 2) PB scale object store for GPU Fleet
 
 Build from source and have an S3 compatible store running in four steps. Install the dependencies and build the OpenLake binary locally. 
 
