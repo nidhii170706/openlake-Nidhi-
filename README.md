@@ -32,7 +32,7 @@ Fast, easy and efficient storage for LLM Inference and Training
 
 ## Why OpenLake?
 
-OpenLake is an object store for AI infrastructure. With OpenLake you get high throughput for small I/O and cache like performance while being fully persistent and durable. 
+OpenLake is a storage engine for AI infrastructure. With OpenLake you get high throughput for small I/O and cache like performance while being fully persistent and durable. 
 Keep GPUs fed during training and inference reducing idle time and getting more from your accelerators.
 
 OpenLake is fast with:
