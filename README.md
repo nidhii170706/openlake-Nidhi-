@@ -2,7 +2,7 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/openlake-project/openlake/refs/heads/main/assets/openlake-logo-wide-dark.png">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/openlake-project/openlake/refs/heads/main/assets/openlake-logo-wide-dark.png" width=60%>
   <img alt="OpenLake" src="https://raw.githubusercontent.com/openlake-project/openlake/refs/heads/main/assets/openlake-logo-wide.png" width=60%>
 </picture>
 
