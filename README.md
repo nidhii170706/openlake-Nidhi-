@@ -25,7 +25,7 @@ Fast, easy and efficient storage for LLM Inference and Training
 
 </div>
 
-🔥 Distributed object storage for GPU workloads. Built on Rust on `io_uring`, OpenLake is a state of the art storage engine delivering million+ iops within 1ms.
+🔥 Distributed storage for GPU workloads. Built on Rust on `io_uring`, OpenLake is a state of the art storage engine delivering million+ iops within 1ms.
 
 ---
 
