@@ -13,7 +13,7 @@ Fast, easy and efficient storage for LLM Inference and Training
 
 
 <p align="center">
-| <a href="https://cloud.theopenlake.com/blog"><b>Blog</b></a>  | <a href="https://github.com/openlake-project/openlake/tree/main/docs"><b>Documentation</b></a> | <a href="https://theopenlake.com/compare.html"><b>Comparision</b></a> | <a href="https://discord.gg/TNXqVSnP6x"><b>Discord/X</b></a> | <a href="https://theopenlake.com"><b>Website</b></a> |
+| <a href="https://theopenlake.com/blog"><b>Blog</b></a>  | <a href="https://github.com/openlake-project/openlake/tree/main/docs"><b>Documentation</b></a> | <a href="https://theopenlake.com/compare.html"><b>Comparision</b></a> | <a href="https://discord.gg/TNXqVSnP6x"><b>Discord/X</b></a> | <a href="https://theopenlake.com"><b>Website</b></a> |
 </p>
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -42,7 +42,7 @@ OpenLake is fast with:
  - **Model Training**: Small file I/O and fast random reads, reduced GPU costs/training time.
  - **Context Storage**: Store massive conversations, memories and context for fast agentic retrieval.
 
-Learn more: [Blogs →](https://cloud.theopenlake.com/blog) | [Benchmarks →](https://cloud.theopenlake.com/blog/taming-the-beast-managing-100-tb-of-kv-cache-on-open-source-inference) | [KV Offload](#1-convert-your-gpu-nodes-into-infinite-kv-pool) | [Object Store](#2-pb-scale-object-store-for-your-gpu-fleet)
+Learn more: [Blogs →](https://theopenlake.com/blog) | [Benchmarks →](https://theopenlake.com/blog/taming-the-beast-managing-100-tb-of-kv-cache-on-open-source-inference) | [KV Offload](#1-convert-your-gpu-nodes-into-infinite-kv-pool) | [Object Store](#2-pb-scale-object-store-for-your-gpu-fleet)
 
 
 <br>
@@ -262,7 +262,7 @@ OpenLake keeps the path from storage to GPU memory short, predictable, and low l
 
 Explore the architecture and [user docs](https://github.com/openlake-project/openlake/tree/main/docs), inspect the
 [included configurations](https://github.com/openlake-project/openlake/tree/main/crates/openlake_server/configs), or read the
-[OpenLake engineering blog](https://cloud.theopenlake.com/blog) for deeper 
+[OpenLake engineering blog](https://theopenlake.com/blog) for deeper 
 technical discussions.
 
 
