@@ -117,8 +117,7 @@ impl SlotPool {
             .collect()
     }
 
-    #[cfg(test)]
-    pub fn occupancy(&self) -> usize {
+    pub(crate) fn occupancy(&self) -> usize {
         self.by_hash.len()
     }
 
@@ -189,6 +188,7 @@ pub trait KvSlab {
     fn reset(&self);
     fn slot_bytes(&self) -> u32;
     fn slot_count(&self) -> u32;
+    fn used_slots(&self) -> u32;
     fn shm_name(&self) -> Option<&str>;
 }
 
@@ -246,6 +246,9 @@ impl KvSlab for HostSlab {
     fn slot_count(&self) -> u32 {
         self.slot_count
     }
+    fn used_slots(&self) -> u32 {
+        self.slots.borrow().occupancy() as u32
+    }
     fn shm_name(&self) -> Option<&str> {
         Some(&self.name)
     }
@@ -263,12 +266,27 @@ impl Drop for HostSlab {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum KvRequest {
-    Attach { slot_bytes: u32 },
-    Reserve { count: u32 },
-    Commit { entries: Vec<(u32, Vec<u8>)> },
-    Lookup { keys: Vec<Vec<u8>> },
-    Release { slots: Vec<u32> },
+    Attach {
+        slot_bytes: u32,
+    },
+    Reserve {
+        count: u32,
+    },
+    Commit {
+        entries: Vec<(u32, Vec<u8>)>,
+    },
+    Lookup {
+        keys: Vec<Vec<u8>>,
+    },
+    Release {
+        slots: Vec<u32>,
+    },
     Reset,
+    /// Resolve slots for a data read. Unlike `Lookup`, this may be counted as
+    /// cache data served by node telemetry.
+    Read {
+        keys: Vec<Vec<u8>>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -316,6 +334,9 @@ pub fn serve_tcp(slab: &dyn KvSlab, req: KvRequest) -> KvResponse {
             slab.reset();
             KvResponse::Ok
         }
+        KvRequest::Read { keys } => KvResponse::Looked {
+            slots: slab.lookup(&keys),
+        },
     }
 }
 

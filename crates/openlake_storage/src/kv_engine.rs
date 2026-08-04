@@ -1,8 +1,38 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use openlake_io::kv::{self, HostSlab, KvRequest, KvResponse, KvSlab};
+use serde::Serialize;
+
+const BLOCK_HASH_BYTES: usize = 32;
+
+fn logical_block_ids(keys: &[Vec<u8>]) -> Option<Vec<[u8; BLOCK_HASH_BYTES]>> {
+    keys.iter()
+        .map(|key| key.get(..BLOCK_HASH_BYTES)?.try_into().ok())
+        .collect()
+}
+
+fn successful_logical_blocks(
+    logical_ids: &[[u8; BLOCK_HASH_BYTES]],
+    slots: &[Option<u32>],
+) -> Option<usize> {
+    if logical_ids.len() != slots.len() {
+        return None;
+    }
+
+    let mut complete_hits = HashMap::<[u8; BLOCK_HASH_BYTES], bool>::new();
+    for (logical_id, slot) in logical_ids.iter().zip(slots) {
+        complete_hits
+            .entry(*logical_id)
+            .and_modify(|all_groups_hit| *all_groups_hit &= slot.is_some())
+            .or_insert_with(|| slot.is_some());
+    }
+    Some(complete_hits.values().filter(|hit| **hit).count())
+}
 
 fn human_bytes(n: u64) -> String {
     const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -21,6 +51,7 @@ fn human_bytes(n: u64) -> String {
 pub struct KvEngine {
     slab: RefCell<Option<Rc<dyn KvSlab>>>,
     capacity_bytes: u64,
+    metrics: Arc<KvEngineMetrics>,
     reserve_ttl: Duration,
     #[cfg(all(feature = "rdma", target_os = "linux"))]
     dev: Option<Rc<openlake_io::rdma::IbDevice>>,
@@ -32,11 +63,87 @@ pub struct KvEngine {
     on_attach: RefCell<Option<Box<dyn Fn(u16, u16)>>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct KvEngineStats {
+    pub configured_capacity_bytes: u64,
+    pub attached: bool,
+    pub slot_bytes: Option<u32>,
+    pub slot_count: Option<u32>,
+    pub used_slots: Option<u32>,
+    pub used_bytes: u64,
+    pub served_blocks: u64,
+}
+
+pub struct KvEngineMetrics {
+    capacity_bytes: u64,
+    attached: AtomicBool,
+    slot_bytes: AtomicU32,
+    slot_count: AtomicU32,
+    used_slots: AtomicU32,
+    served_blocks: AtomicU64,
+}
+
+impl KvEngineMetrics {
+    fn new(capacity_bytes: u64) -> Self {
+        Self {
+            capacity_bytes,
+            attached: AtomicBool::new(false),
+            slot_bytes: AtomicU32::new(0),
+            slot_count: AtomicU32::new(0),
+            used_slots: AtomicU32::new(0),
+            served_blocks: AtomicU64::new(0),
+        }
+    }
+
+    fn update(&self, slab: &dyn KvSlab) {
+        self.slot_bytes.store(slab.slot_bytes(), Ordering::Relaxed);
+        self.slot_count.store(slab.slot_count(), Ordering::Relaxed);
+        self.used_slots.store(slab.used_slots(), Ordering::Relaxed);
+        self.attached.store(true, Ordering::Release);
+    }
+
+    pub fn snapshot(&self) -> KvEngineStats {
+        if self.attached.load(Ordering::Acquire) {
+            let slot_bytes = self.slot_bytes.load(Ordering::Relaxed);
+            let used_slots = self.used_slots.load(Ordering::Relaxed);
+            KvEngineStats {
+                configured_capacity_bytes: self.capacity_bytes,
+                attached: true,
+                slot_bytes: Some(slot_bytes),
+                slot_count: Some(self.slot_count.load(Ordering::Relaxed)),
+                used_slots: Some(used_slots),
+                used_bytes: u64::from(slot_bytes) * u64::from(used_slots),
+                served_blocks: self.served_blocks.load(Ordering::Relaxed),
+            }
+        } else {
+            KvEngineStats {
+                configured_capacity_bytes: self.capacity_bytes,
+                attached: false,
+                slot_bytes: None,
+                slot_count: None,
+                used_slots: None,
+                used_bytes: 0,
+                served_blocks: self.served_blocks.load(Ordering::Relaxed),
+            }
+        }
+    }
+
+    fn record_served_blocks(&self, count: usize) {
+        let count = count as u64;
+        let _ = self
+            .served_blocks
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(count))
+            });
+    }
+}
+
 impl KvEngine {
     pub fn new_tcp(capacity_bytes: u64, reserve_ttl: Duration) -> Self {
         Self {
             slab: RefCell::new(None),
             capacity_bytes,
+            metrics: Arc::new(KvEngineMetrics::new(capacity_bytes)),
             reserve_ttl,
             #[cfg(all(feature = "rdma", target_os = "linux"))]
             dev: None,
@@ -60,6 +167,7 @@ impl KvEngine {
         Self {
             slab: RefCell::new(None),
             capacity_bytes,
+            metrics: Arc::new(KvEngineMetrics::new(capacity_bytes)),
             reserve_ttl,
             dev: Some(dev),
             registry: Some(registry),
@@ -91,20 +199,50 @@ impl KvEngine {
                 }
             }
         }
+        let update_metrics = matches!(
+            &req,
+            KvRequest::Attach { .. }
+                | KvRequest::Reserve { .. }
+                | KvRequest::Commit { .. }
+                | KvRequest::Release { .. }
+                | KvRequest::Reset
+        );
         match &*self.slab.borrow() {
             Some(slab) => {
+                let logical_read_ids = match &req {
+                    KvRequest::Read { keys } => logical_block_ids(keys),
+                    _ => None,
+                };
                 let committed = if let KvRequest::Commit { entries } = &req {
                     entries.len()
                 } else {
                     0
                 };
                 let resp = kv::serve_tcp(&**slab, req);
+                if update_metrics {
+                    self.metrics.update(&**slab);
+                }
                 match &resp {
-                    KvResponse::Looked { slots } => tracing::info!(
-                        "kv load lookup: {} blocks queried, {} hits served",
-                        slots.len(),
-                        slots.iter().filter(|s| s.is_some()).count(),
-                    ),
+                    KvResponse::Looked { slots } => {
+                        let hits = slots.iter().filter(|slot| slot.is_some()).count();
+                        if let Some(logical_ids) = &logical_read_ids {
+                            let logical_hits =
+                                successful_logical_blocks(logical_ids, slots).unwrap_or_default();
+                            self.metrics.record_served_blocks(logical_hits);
+                            tracing::info!(
+                                "kv read: {} physical blocks requested, {} hits, {} logical blocks served",
+                                slots.len(),
+                                hits,
+                                logical_hits,
+                            );
+                        } else {
+                            tracing::info!(
+                                "kv lookup: {} blocks queried, {} hits found",
+                                slots.len(),
+                                hits,
+                            );
+                        }
+                    }
                     KvResponse::Ok if committed > 0 => {
                         tracing::info!("kv store: {} blocks committed", committed)
                     }
@@ -123,6 +261,14 @@ impl KvEngine {
                 ),
             },
         }
+    }
+
+    pub fn stats(&self) -> KvEngineStats {
+        self.metrics.snapshot()
+    }
+
+    pub fn metrics(&self) -> Arc<KvEngineMetrics> {
+        self.metrics.clone()
     }
 
     #[cfg(all(feature = "rdma", target_os = "linux"))]
@@ -163,6 +309,9 @@ impl KvEngine {
                 slot_count,
             );
             *self.slab.borrow_mut() = Some(Rc::new(slab));
+            if let Some(slab) = self.slab.borrow().as_ref() {
+                self.metrics.update(&**slab);
+            }
             let registry = self
                 .registry
                 .as_ref()
@@ -197,7 +346,11 @@ impl KvEngine {
                 "no kv slab yet: call attach first for client discovery/exchange".into(),
             )));
         };
-        match req {
+        let update_metrics = matches!(
+            &req,
+            BatchReserve { .. } | BatchCommit { .. } | BatchRelease { .. } | Reset
+        );
+        let response = match req {
             BatchReserve { count } => RdmaResponse::BatchReserved {
                 slots: slab.reserve(count),
             },
@@ -212,6 +365,16 @@ impl KvEngine {
             BatchLookup { key_hashes } => RdmaResponse::BatchLookedUp {
                 slots: slab.lookup(&key_hashes),
             },
+            BatchRead { key_hashes } => {
+                let logical_ids = logical_block_ids(&key_hashes);
+                let slots = slab.lookup(&key_hashes);
+                let logical_hits = logical_ids
+                    .as_deref()
+                    .and_then(|ids| successful_logical_blocks(ids, &slots))
+                    .unwrap_or_default();
+                self.metrics.record_served_blocks(logical_hits);
+                RdmaResponse::BatchLookedUp { slots }
+            }
             BatchRelease { slot_idxs } => {
                 slab.release(&slot_idxs);
                 RdmaResponse::BatchReleased
@@ -221,7 +384,11 @@ impl KvEngine {
                 RdmaResponse::ResetDone
             }
             req => unreachable!("kv engine routed a foreign request: {req:?}"),
+        };
+        if update_metrics {
+            self.metrics.update(&**slab);
         }
+        response
     }
 }
 
@@ -282,5 +449,94 @@ mod tests {
         let (again, sb, sc) = attach(&e, 8192);
         assert_eq!(again, first);
         assert_eq!((sb, sc), (4096, 16));
+    }
+
+    #[test]
+    fn stats_report_attached_slab_occupancy() {
+        let e = KvEngine::new_tcp(64 * 1024, Duration::from_secs(60));
+        assert_eq!(e.stats().used_bytes, 0);
+        let (_, slot_bytes, slot_count) = attach(&e, 1024);
+
+        let before = e.stats();
+        assert!(before.attached);
+        assert_eq!(before.slot_bytes, Some(slot_bytes));
+        assert_eq!(before.slot_count, Some(slot_count));
+        assert_eq!(before.used_slots, Some(0));
+        assert_eq!(before.used_bytes, 0);
+
+        let slot = match e.serve_tcp(KvRequest::Reserve { count: 1 }) {
+            KvResponse::Reserved { slots } => slots[0],
+            other => panic!("reserve: {other:?}"),
+        };
+        assert!(matches!(
+            e.serve_tcp(KvRequest::Commit {
+                entries: vec![(slot, vec![7; 54])],
+            }),
+            KvResponse::Ok
+        ));
+        assert_eq!(e.stats().used_slots, Some(1));
+        assert_eq!(e.stats().used_bytes, 1024);
+    }
+
+    #[test]
+    fn stats_count_complete_logical_reads_not_existence_probes() {
+        let e = KvEngine::new_tcp(64 * 1024, Duration::from_secs(60));
+        attach(&e, 1024);
+
+        let mut group_zero = vec![3u8; 54];
+        let mut group_one = group_zero.clone();
+        group_zero[32] = 0;
+        group_one[32] = 1;
+        let slots = match e.serve_tcp(KvRequest::Reserve { count: 2 }) {
+            KvResponse::Reserved { slots } => slots,
+            other => panic!("reserve: {other:?}"),
+        };
+        assert!(matches!(
+            e.serve_tcp(KvRequest::Commit {
+                entries: vec![
+                    (slots[0], group_zero.clone()),
+                    (slots[1], group_one.clone()),
+                ],
+            }),
+            KvResponse::Ok
+        ));
+
+        assert!(matches!(
+            e.serve_tcp(KvRequest::Lookup {
+                keys: vec![group_zero.clone(), group_one.clone()],
+            }),
+            KvResponse::Looked { .. }
+        ));
+        assert_eq!(e.stats().served_blocks, 0);
+
+        assert!(matches!(
+            e.serve_tcp(KvRequest::Read {
+                keys: vec![group_zero, group_one],
+            }),
+            KvResponse::Looked { .. }
+        ));
+        assert_eq!(e.stats().served_blocks, 1);
+
+        let mut partial_hit = vec![4u8; 54];
+        let mut partial_miss = partial_hit.clone();
+        partial_hit[32] = 0;
+        partial_miss[32] = 1;
+        let slot = match e.serve_tcp(KvRequest::Reserve { count: 1 }) {
+            KvResponse::Reserved { slots } => slots[0],
+            other => panic!("reserve: {other:?}"),
+        };
+        assert!(matches!(
+            e.serve_tcp(KvRequest::Commit {
+                entries: vec![(slot, partial_hit.clone())],
+            }),
+            KvResponse::Ok
+        ));
+        assert!(matches!(
+            e.serve_tcp(KvRequest::Read {
+                keys: vec![partial_hit, partial_miss],
+            }),
+            KvResponse::Looked { .. }
+        ));
+        assert_eq!(e.stats().served_blocks, 1);
     }
 }
