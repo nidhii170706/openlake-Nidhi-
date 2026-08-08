@@ -138,7 +138,7 @@ pub struct Config {
     #[serde(default)]
     pub mode: Mode,
     #[serde(default)]
-    pub transport: TransportMode, // h2 (default) | rdma
+    pub transport: TransportMode,
     #[serde(default)]
     pub rdma: Option<RdmaToml>, // required when transport = rdma
     #[serde(default)]
@@ -203,6 +203,14 @@ pub enum TransportMode {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum RdmaBackend {
+    #[default]
+    Dct,
+    Ucx,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Mode {
     #[default]
     Storage,
@@ -211,10 +219,16 @@ pub enum Mode {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RdmaToml {
-    pub self_node_id: u16,
-    pub dev_name: String,
-    pub dc_key: u64,
-    pub qos: RdmaQosToml,
+    #[serde(default)]
+    pub backend: RdmaBackend,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_node_id: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dev_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dc_key: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qos: Option<RdmaQosToml>,
     #[serde(default = "default_bulk_pool_cap")]
     pub bulk_pool_cap: usize,
     #[serde(default = "default_network_timeout_secs")]
@@ -348,7 +362,19 @@ impl Config {
                 anyhow::bail!("mode = \"kv\" nodes are standalone; list only this node");
             }
         }
-        if let Some(r) = &cfg.rdma {
+        if let Some(r) = cfg.rdma.as_ref().filter(|r| r.backend == RdmaBackend::Dct) {
+            if r.self_node_id.is_none() {
+                anyhow::bail!("[rdma] self_node_id is required for backend = \"dct\"");
+            }
+            if r.dev_name.as_deref().is_none_or(str::is_empty) {
+                anyhow::bail!("[rdma] dev_name is required for backend = \"dct\"");
+            }
+            if r.dc_key.is_none() {
+                anyhow::bail!("[rdma] dc_key is required for backend = \"dct\"");
+            }
+            if r.qos.is_none() {
+                anyhow::bail!("[rdma.qos] is required for backend = \"dct\"");
+            }
             if r.peer_credit == 0 {
                 anyhow::bail!("[rdma] peer_credit must be >= 1");
             }
@@ -462,10 +488,14 @@ impl Config {
             anyhow::bail!("transport = \"rdma\" requires an [rdma] config block");
         }
         if cfg.transport == TransportMode::Rdma {
+            let rdma = cfg.rdma.as_ref().expect("checked above");
             if !cfg!(all(feature = "rdma", target_os = "linux")) {
                 anyhow::bail!(
                     "transport = \"rdma\" requires the `rdma` cargo feature on a Linux build"
                 );
+            }
+            if rdma.backend == RdmaBackend::Ucx && cfg.mode != Mode::Kv {
+                anyhow::bail!("[rdma] backend = \"ucx\" currently supports mode = \"kv\" only");
             }
         }
         Ok(cfg)
@@ -520,5 +550,26 @@ mod kv_slab_tests {
             bytes,
             (total_system_ram_bytes().unwrap() as f64 * 0.5) as u64 / GIB * GIB
         );
+    }
+
+    #[test]
+    fn rdma_backend_defaults_to_dct() {
+        let rdma: RdmaToml = toml::from_str(
+            r#"
+self_node_id = 0
+dev_name = "mlx5_0"
+dc_key = 4919
+qos = { traffic_class = 0, service_level = 0 }
+"#,
+        )
+        .unwrap();
+        assert_eq!(rdma.backend, RdmaBackend::Dct);
+    }
+
+    #[test]
+    fn ucx_backend_does_not_require_dct_fields() {
+        let rdma: RdmaToml = toml::from_str("backend = \"ucx\"").unwrap();
+        assert_eq!(rdma.backend, RdmaBackend::Ucx);
+        assert!(rdma.dev_name.is_none());
     }
 }
