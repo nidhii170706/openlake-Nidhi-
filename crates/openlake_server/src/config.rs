@@ -111,6 +111,10 @@ pub struct Config {
     /// empty credential list so it cannot accidentally run open.
     pub credentials: Vec<Credential>,
     pub nodes: Vec<NodeAddr>,
+    /// Ordered KV-agent RPC endpoints used for peer discovery and telemetry.
+    /// KV engines remain standalone; this list does not create storage peers.
+    #[serde(default)]
+    pub kv_agents: Vec<SocketAddr>,
     /// Optional TLS for the customer-facing S3 listener. When absent
     /// the listener serves plaintext HTTP/1.1; when present it serves
     /// only HTTPS with the supplied cert chain + key.
@@ -361,6 +365,28 @@ impl Config {
             if cfg.nodes.len() != 1 {
                 anyhow::bail!("mode = \"kv\" nodes are standalone; list only this node");
             }
+            if cfg.kv_agents.len() > u16::MAX as usize + 1 {
+                anyhow::bail!(
+                    "kv_agents contains more than {} addressable nodes",
+                    u16::MAX as usize + 1
+                );
+            }
+            if !cfg.kv_agents.is_empty() && cfg.self_id as usize >= cfg.kv_agents.len() {
+                anyhow::bail!(
+                    "self_id {} is outside the ordered kv_agents list ({} entries)",
+                    cfg.self_id,
+                    cfg.kv_agents.len(),
+                );
+            }
+            let unique_agents = cfg
+                .kv_agents
+                .iter()
+                .collect::<std::collections::HashSet<_>>();
+            if unique_agents.len() != cfg.kv_agents.len() {
+                anyhow::bail!("kv_agents contains duplicate RPC endpoints");
+            }
+        } else if !cfg.kv_agents.is_empty() {
+            anyhow::bail!("kv_agents is only valid when mode = \"kv\"");
         }
         if let Some(r) = cfg.rdma.as_ref().filter(|r| r.backend == RdmaBackend::Dct) {
             if r.self_node_id.is_none() {
@@ -571,5 +597,38 @@ qos = { traffic_class = 0, service_level = 0 }
         let rdma: RdmaToml = toml::from_str("backend = \"ucx\"").unwrap();
         assert_eq!(rdma.backend, RdmaBackend::Ucx);
         assert!(rdma.dev_name.is_none());
+    }
+
+    #[test]
+    fn kv_mode_retains_the_ordered_agent_reference_list() {
+        let cfg = Config::from_toml(
+            r#"
+self_id = 1
+mode = "kv"
+rpc_addr = "0.0.0.0:9400"
+s3_addr = "0.0.0.0:9000"
+data_dirs = []
+set_drive_count = 1
+default_parity_count = 1
+region = "us-east-1"
+kv_agents = ["10.0.0.1:9400", "10.0.0.2:9400"]
+
+[[credentials]]
+access_key = "test"
+secret_key = "test"
+
+[[nodes]]
+id = 1
+rpc_addr = "0.0.0.0:9400"
+disk_count = 0
+
+[kv_slab]
+capacity_gb = 1
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.kv_agents[0], "10.0.0.1:9400".parse().unwrap());
+        assert_eq!(cfg.kv_agents[1], "10.0.0.2:9400".parse().unwrap());
     }
 }

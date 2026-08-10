@@ -313,6 +313,7 @@ impl KvEngine {
         epoch: u64,
         client_worker_address: &[u8],
         slot_bytes: u32,
+        dry_run: bool,
     ) -> Result<openlake_io::rpc::UcxEndpointReply, String> {
         if slot_bytes != 0 && slot_bytes <= BLOCK_HASH_BYTES as u32 {
             return Err(format!(
@@ -322,6 +323,19 @@ impl KvEngine {
 
         let mut ucx = self.ucx.borrow_mut();
         let state = ucx.as_mut().ok_or("engine is not configured for UCX")?;
+        if dry_run {
+            let endpoint = state.worker.connect(client_worker_address)?;
+            return Ok(openlake_io::rpc::UcxEndpointReply {
+                protocol_version: openlake_io::rpc::UCX_PROTOCOL_VERSION,
+                is_connected: true,
+                worker_address: state.worker.address()?,
+                slab_base: 0,
+                packed_rkey: Vec::new(),
+                slot_bytes: 0,
+                slot_count: 0,
+                capabilities: endpoint.transports()?,
+            });
+        }
         if state
             .peers
             .get(&client)
@@ -332,15 +346,16 @@ impl KvEngine {
             ));
         }
         let endpoint = state.worker.connect(client_worker_address)?;
-
         if slot_bytes == 0 {
             let reply = openlake_io::rpc::UcxEndpointReply {
                 protocol_version: openlake_io::rpc::UCX_PROTOCOL_VERSION,
+                is_connected: true,
                 worker_address: state.worker.address()?,
                 slab_base: 0,
                 packed_rkey: Vec::new(),
                 slot_bytes: 0,
                 slot_count: 0,
+                capabilities: Vec::new(),
             };
             state.peers.insert(client, (epoch, endpoint));
             return Ok(reply);
@@ -377,11 +392,13 @@ impl KvEngine {
         let memory = state.memory.as_ref().expect("UCX memory registered above");
         let reply = openlake_io::rpc::UcxEndpointReply {
             protocol_version: openlake_io::rpc::UCX_PROTOCOL_VERSION,
+            is_connected: true,
             worker_address: state.worker.address()?,
             slab_base: slab.base_address().expect("host slab has an address"),
             packed_rkey: memory.packed_rkey()?,
             slot_bytes: slab.slot_bytes(),
             slot_count: slab.slot_count(),
+            capabilities: Vec::new(),
         };
         state.peers.insert(client, (epoch, endpoint));
         Ok(reply)

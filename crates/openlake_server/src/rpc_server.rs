@@ -858,6 +858,7 @@ pub(crate) async fn dispatch(
             epoch,
             worker_address,
             slot_bytes,
+            dry_run,
         } => {
             #[cfg(all(feature = "rdma", target_os = "linux"))]
             {
@@ -875,13 +876,23 @@ pub(crate) async fn dispatch(
                         ))
                     }
                     Some(engine) => {
-                        engine.attach_ucx(client_node_id, epoch, &worker_address, slot_bytes)
+                        engine.attach_ucx(
+                            client_node_id,
+                            epoch,
+                            &worker_address,
+                            slot_bytes,
+                            dry_run,
+                        )
                     }
                 };
                 match res {
                     Ok(reply) => {
-                        tracing::info!(client_node_id, epoch, "ucx client attached");
+                        tracing::info!(client_node_id, epoch, dry_run, "ucx attach completed");
                         RpcResponse::UcxAttached(reply)
+                    }
+                    Err(why) if dry_run => {
+                        tracing::debug!(client_node_id, why, "ucx probe not connected");
+                        RpcResponse::UcxAttached(openlake_io::rpc::UcxEndpointReply::disconnected())
                     }
                     Err(why) => {
                         tracing::warn!(client_node_id, why, "ucx attach denied");
@@ -892,9 +903,13 @@ pub(crate) async fn dispatch(
             #[cfg(not(all(feature = "rdma", target_os = "linux")))]
             {
                 let _ = (&kv, protocol_version, epoch, &worker_address, slot_bytes);
-                RpcResponse::UcxAttachDenied(format!(
-                    "node {client_node_id} tried UCX attach on a server built without RDMA transports"
-                ))
+                if dry_run {
+                    RpcResponse::UcxAttached(openlake_io::rpc::UcxEndpointReply::disconnected())
+                } else {
+                    RpcResponse::UcxAttachDenied(format!(
+                        "node {client_node_id} tried UCX attach on a server built without RDMA transports"
+                    ))
+                }
             }
         }
     }

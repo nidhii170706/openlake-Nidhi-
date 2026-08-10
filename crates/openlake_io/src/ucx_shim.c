@@ -31,6 +31,10 @@ typedef struct {
     ucp_rkey_h rkey;
 } ol_ucx_rkey;
 
+typedef struct {
+    void (*complete)(void *completion, int status);
+} ol_ucx_completion;
+
 static int ol_error(char *error, size_t error_len, const char *operation,
                     ucs_status_t status) {
     if (error != NULL && error_len != 0) {
@@ -40,14 +44,38 @@ static int ol_error(char *error, size_t error_len, const char *operation,
     return (int)status;
 }
 
-static int ol_start(void *request, void **out, char *error, size_t error_len,
-                    const char *operation) {
+static void ol_complete(ol_ucx_completion *completion, ucs_status_t status) {
+    completion->complete(completion, (int)status);
+}
+
+static void ol_send_complete(void *request, ucs_status_t status,
+                             void *user_data) {
+    (void)request;
+    ol_complete(user_data, status);
+}
+
+static ucp_request_param_t ol_request_params(
+    ol_ucx_completion *completion) {
+    ucp_request_param_t params;
+    memset(&params, 0, sizeof(params));
+    params.op_attr_mask =
+        UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA;
+    params.cb.send = ol_send_complete;
+    params.user_data = completion;
+    return params;
+}
+
+static int ol_start(void *request, ol_ucx_completion *completion, void **out,
+                    char *error, size_t error_len, const char *operation) {
     *out = NULL;
     if (request == NULL) {
+        ol_complete(completion, UCS_OK);
         return 0;
     }
     if (UCS_PTR_IS_ERR(request)) {
-        return ol_error(error, error_len, operation, UCS_PTR_STATUS(request));
+        ucs_status_t status = UCS_PTR_STATUS(request);
+        ol_complete(completion, status);
+        return ol_error(error, error_len, operation, status);
     }
     *out = request;
     return 0;
@@ -85,7 +113,7 @@ int ol_ucx_worker_create(ol_ucx_worker **out, char *error, size_t error_len) {
     ucp_params_t params;
     memset(&params, 0, sizeof(params));
     params.field_mask = UCP_PARAM_FIELD_FEATURES;
-    params.features = UCP_FEATURE_RMA | UCP_FEATURE_TAG;
+    params.features = UCP_FEATURE_RMA | UCP_FEATURE_TAG | UCP_FEATURE_WAKEUP;
     status = ucp_init(&params, config, &worker->context);
     ucp_config_release(config);
     if (status != UCS_OK) {
@@ -121,6 +149,32 @@ void ol_ucx_worker_destroy(ol_ucx_worker *worker) {
 
 unsigned ol_ucx_worker_progress(ol_ucx_worker *worker) {
     return ucp_worker_progress(worker->worker);
+}
+
+int ol_ucx_worker_get_efd(ol_ucx_worker *worker, int *out, char *error,
+                          size_t error_len) {
+    ucs_status_t status = ucp_worker_get_efd(worker->worker, out);
+    return status == UCS_OK
+               ? 0
+               : ol_error(error, error_len, "ucp_worker_get_efd", status);
+}
+
+int ol_ucx_worker_arm(ol_ucx_worker *worker, char *error, size_t error_len) {
+    ucs_status_t status = ucp_worker_arm(worker->worker);
+    if (status == UCS_ERR_BUSY) {
+        return OL_UCX_NO_MESSAGE;
+    }
+    return status == UCS_OK
+               ? 0
+               : ol_error(error, error_len, "ucp_worker_arm", status);
+}
+
+int ol_ucx_worker_signal(ol_ucx_worker *worker, char *error,
+                         size_t error_len) {
+    ucs_status_t status = ucp_worker_signal(worker->worker);
+    return status == UCS_OK
+               ? 0
+               : ol_error(error, error_len, "ucp_worker_signal", status);
 }
 
 int ol_ucx_worker_address(ol_ucx_worker *worker, uint8_t **out,
@@ -184,6 +238,24 @@ void ol_ucx_endpoint_destroy(ol_ucx_endpoint *endpoint) {
     }
     ucp_ep_destroy(endpoint->ep);
     free(endpoint);
+}
+
+int ol_ucx_endpoint_query_transports(ol_ucx_endpoint *endpoint,
+                                     ucp_transport_entry_t *entries,
+                                     size_t capacity, size_t *out_len,
+                                     char *error, size_t error_len) {
+    ucp_ep_attr_t attributes;
+    memset(&attributes, 0, sizeof(attributes));
+    attributes.field_mask = UCP_EP_ATTR_FIELD_TRANSPORTS;
+    attributes.transports.entries = entries;
+    attributes.transports.num_entries = (unsigned)capacity;
+    attributes.transports.entry_size = sizeof(entries[0]);
+
+    ucs_status_t status = ucp_ep_query(endpoint->ep, &attributes);
+    *out_len = attributes.transports.num_entries;
+    return status == UCS_OK
+               ? 0
+               : ol_error(error, error_len, "ucp_ep_query", status);
 }
 
 int ol_ucx_memory_register(ol_ucx_worker *worker, uint64_t address,
@@ -281,83 +353,74 @@ void ol_ucx_rkey_destroy(ol_ucx_rkey *rkey) {
 
 int ol_ucx_put_start(ol_ucx_endpoint *endpoint, uint64_t local_address,
                      uint64_t length, uint64_t remote_address,
-                     ol_ucx_rkey *rkey, void **out, char *error,
-                     size_t error_len) {
+                     ol_ucx_rkey *rkey, ol_ucx_completion *completion,
+                     void **out, char *error, size_t error_len) {
     *out = NULL;
     if (endpoint->status != UCS_OK) {
+        ol_complete(completion, endpoint->status);
         return ol_error(error, error_len, "UCX endpoint", endpoint->status);
     }
-    ucp_request_param_t params;
-    memset(&params, 0, sizeof(params));
+    ucp_request_param_t params = ol_request_params(completion);
     void *request = ucp_put_nbx(endpoint->ep,
                                 (const void *)(uintptr_t)local_address,
                                 (size_t)length, remote_address, rkey->rkey,
                                 &params);
-    return ol_start(request, out, error, error_len, "ucp_put_nbx");
+    return ol_start(request, completion, out, error, error_len,
+                    "ucp_put_nbx");
 }
 
 int ol_ucx_get_start(ol_ucx_endpoint *endpoint, uint64_t local_address,
                      uint64_t length, uint64_t remote_address,
-                     ol_ucx_rkey *rkey, void **out, char *error,
-                     size_t error_len) {
+                     ol_ucx_rkey *rkey, ol_ucx_completion *completion,
+                     void **out, char *error, size_t error_len) {
     *out = NULL;
     if (endpoint->status != UCS_OK) {
+        ol_complete(completion, endpoint->status);
         return ol_error(error, error_len, "UCX endpoint", endpoint->status);
     }
-    ucp_request_param_t params;
-    memset(&params, 0, sizeof(params));
+    ucp_request_param_t params = ol_request_params(completion);
     void *request = ucp_get_nbx(endpoint->ep, (void *)(uintptr_t)local_address,
                                 (size_t)length, remote_address, rkey->rkey,
                                 &params);
-    return ol_start(request, out, error, error_len, "ucp_get_nbx");
+    return ol_start(request, completion, out, error, error_len,
+                    "ucp_get_nbx");
 }
 
-int ol_ucx_endpoint_flush_start(ol_ucx_endpoint *endpoint, void **out,
+int ol_ucx_endpoint_flush_start(ol_ucx_endpoint *endpoint,
+                                ol_ucx_completion *completion, void **out,
                                 char *error, size_t error_len) {
     *out = NULL;
     if (endpoint->status != UCS_OK) {
+        ol_complete(completion, endpoint->status);
         return ol_error(error, error_len, "UCX endpoint", endpoint->status);
     }
-    ucp_request_param_t params;
-    memset(&params, 0, sizeof(params));
+    ucp_request_param_t params = ol_request_params(completion);
     void *request = ucp_ep_flush_nbx(endpoint->ep, &params);
-    return ol_start(request, out, error, error_len, "ucp_ep_flush_nbx");
+    return ol_start(request, completion, out, error, error_len,
+                    "ucp_ep_flush_nbx");
 }
 
 int ol_ucx_tag_send_start(ol_ucx_endpoint *endpoint, const uint8_t *data,
-                          size_t length, void **out, char *error,
-                          size_t error_len) {
+                          size_t length, ol_ucx_completion *completion,
+                          void **out, char *error, size_t error_len) {
     *out = NULL;
     if (endpoint->status != UCS_OK) {
+        ol_complete(completion, endpoint->status);
         return ol_error(error, error_len, "UCX endpoint", endpoint->status);
     }
     if (data == NULL || length == 0) {
+        ol_complete(completion, UCS_ERR_INVALID_PARAM);
         return ol_error(error, error_len, "empty UCX control message",
                         UCS_ERR_INVALID_PARAM);
     }
-    ucp_request_param_t params;
-    memset(&params, 0, sizeof(params));
+    ucp_request_param_t params = ol_request_params(completion);
     void *request = ucp_tag_send_nbx(endpoint->ep, data, length,
                                      OL_UCX_CONTROL_TAG, &params);
-    return ol_start(request, out, error, error_len, "ucp_tag_send_nbx");
+    return ol_start(request, completion, out, error, error_len,
+                    "ucp_tag_send_nbx");
 }
 
-int ol_ucx_request_poll(ol_ucx_worker *worker, void **request, char *error,
-                        size_t error_len) {
-    if (*request == NULL) {
-        return 0;
-    }
-    ucp_worker_progress(worker->worker);
-    ucs_status_t status = ucp_request_check_status(*request);
-    if (status == UCS_INPROGRESS) {
-        return OL_UCX_NO_MESSAGE;
-    }
-    ucp_request_free(*request);
-    *request = NULL;
-    return status == UCS_OK
-               ? 0
-               : ol_error(error, error_len, "UCX request", status);
-}
+void ol_ucx_request_release(void *request) { ucp_request_free(request); }
 
 void ol_ucx_request_cancel(ol_ucx_worker *worker, void *request) {
     ol_cancel_request(worker, request);

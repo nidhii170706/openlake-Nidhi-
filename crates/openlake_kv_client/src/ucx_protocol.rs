@@ -277,21 +277,22 @@ async fn handle(shared: Rc<Shared>, command: Cmd) {
 }
 
 async fn dispatch(shared: Rc<Shared>) {
-    std::future::poll_fn(move |cx| {
-        for _ in 0..64 {
+    loop {
+        loop {
             match shared.worker.poll_control() {
                 Ok(Some(body)) => route_control(&shared, &body),
                 Ok(None) => break,
                 Err(error) => {
                     fail_control(&shared, error);
-                    return std::task::Poll::Ready(());
+                    return;
                 }
             }
         }
-        cx.waker().wake_by_ref();
-        std::task::Poll::Pending
-    })
-    .await
+        if let Err(error) = shared.worker.wait_for_event().await {
+            fail_control(&shared, error);
+            return;
+        }
+    }
 }
 
 fn route_control(shared: &Shared, body: &[u8]) {
@@ -343,6 +344,7 @@ fn attach(shared: &Shared, addr: &str, node_id: u16, slot_bytes: u32) -> Result<
         epoch: shared.epoch.get(),
         worker_address: shared.worker.address()?,
         slot_bytes,
+        dry_run: false,
     };
     let body = rpc::encode(&request).map_err(|e| format!("encode UCX attach: {e}"))?;
     let response = rpc::decode::<Response>(&post(addr, RPC_PATH, &body)?)
@@ -381,6 +383,9 @@ fn validate_reply(reply: &UcxEndpointReply, requested_slot_bytes: u32) -> Result
             "server UCX protocol version {} does not match {}",
             reply.protocol_version, UCX_PROTOCOL_VERSION
         ));
+    }
+    if !reply.is_connected {
+        return Err("server could not establish a UCX endpoint".into());
     }
     if reply.worker_address.is_empty() {
         return Err("server returned an empty UCX worker address".into());

@@ -74,24 +74,30 @@ pub async fn run_ucx(
     let acceptor = tls.rpc_acceptor().map(Rc::new);
 
     let control_engine = engine.clone();
-    compio::runtime::spawn(std::future::poll_fn(move |cx| {
-        for _ in 0..64 {
-            match worker.poll_control() {
-                Ok(Some(body)) => {
-                    let engine = control_engine.clone();
-                    compio::runtime::spawn(async move { handle_ucx_control(engine, &body).await })
+    compio::runtime::spawn(async move {
+        loop {
+            loop {
+                match worker.poll_control() {
+                    Ok(Some(body)) => {
+                        let engine = control_engine.clone();
+                        compio::runtime::spawn(
+                            async move { handle_ucx_control(engine, &body).await },
+                        )
                         .detach();
-                }
-                Ok(None) => break,
-                Err(error) => {
-                    tracing::warn!(%error, "UCX control receive failed");
-                    break;
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::warn!(%error, "UCX control receive failed");
+                        return;
+                    }
                 }
             }
+            if let Err(error) = worker.wait_for_event().await {
+                tracing::warn!(%error, "UCX event wait failed");
+                return;
+            }
         }
-        cx.waker().wake_by_ref();
-        std::task::Poll::<()>::Pending
-    }))
+    })
     .detach();
 
     tracing::info!(rpc = %cfg.rpc_addr, "kv node (ucx) serving");

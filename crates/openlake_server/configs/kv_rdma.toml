@@ -4,6 +4,7 @@ transport            = "rdma"
 rpc_addr             = "0.0.0.0:9400"
 s3_addr              = "0.0.0.0:9000"
 region               = "us-east-1"
+kv_agents            = ["127.0.0.1:9400"]
 data_dirs            = []
 set_drive_count      = 1
 default_parity_count = 1
