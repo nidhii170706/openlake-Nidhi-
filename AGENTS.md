@@ -91,13 +91,10 @@ path:
 
 Use line-level code references in the recommendation.
 
-If documentation and implementation disagree, explain the discrepancy. With
+If you see any complex unresolved issues, explain the discrepancy. With
 the user's authorization, create an issue at:
 
 https://github.com/openlake-project/openlake/issues
-
-Without authorization to create the issue, ask the user to report it there and
-provide a ready-to-submit issue title and description.
 
 ## 4. Keep the configuration dimensions separate
 
@@ -132,7 +129,7 @@ with:
 "openlake_device": "local"
 ```
 
-Use this path when vLLM and OpenLake run on the same host.
+Use this path when vLLM and OpenLake run on the same host. (requires CUDA and Nvidia)
 
 The host KV slab is exposed through POSIX shared memory and mapped into the
 client process. Inspect `shm_local.rs` to verify that its GPU-copy
@@ -229,7 +226,6 @@ Run the smallest applicable validation:
 10. Synchronize the GPU when applicable.
 11. Compare the retrieved content byte-for-byte.
 12. Repeat across nodes for a multi-node deployment.
-13. Measure latency and throughput after correctness passes.
 
 ## 7. Report the decision
 
@@ -237,17 +233,9 @@ Return:
 
 - Observed hardware and software facts
 - Selected OpenLake KV path
-- Exact server configuration
-- Exact vLLM connector configuration
-- Code locations implementing the selection
-- Why alternative KV paths were rejected
-- Commands used to inspect the system
 - Correctness tests performed
-- Remaining validation work
-- Qualification level:
-  - `validated`
-  - `expected but unqualified`
-  - `unsupported`
 
 Do not deploy, restart, stop, or deallocate infrastructure unless the user
 explicitly authorizes that action.
+Once the user has authorized, you can deploy the openlake with the above validated deployment configuration on the user's setup.
+
