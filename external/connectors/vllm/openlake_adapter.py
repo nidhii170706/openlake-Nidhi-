@@ -1042,6 +1042,9 @@ class OpenLakeScheduler:
         nodes = extra.get("openlake_nodes")
         if not nodes:
             raise ValueError("kv_connector_extra_config.openlake_nodes required")
+        self._min_external_lookup_tokens = extra.get(
+            "openlake_min_external_lookup_tokens", 1000
+        )
         self._client = openlake_client.Client(
             device=extra.get("openlake_device", "mlx5_ib0"),
             client_id=int(extra.get("openlake_client_id", 2048)),
@@ -1130,6 +1133,8 @@ class OpenLakeScheduler:
     def get_num_new_matched_tokens(
         self, request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
+        if request.num_prompt_tokens < self._min_external_lookup_tokens:
+            return 0, False
         token_len = request.num_tokens // self._sched_bs * self._sched_bs
         if token_len < self._sched_bs:
             return 0, False
