@@ -229,7 +229,6 @@ pub async fn delete_objects(
             ));
         }
     }
-    
 
     let request: DeleteRequest = quick_xml::de::from_reader(bytes.as_ref())
         .map_err(|_| AppError::Malformed("invalid <Delete> XML"))?;
