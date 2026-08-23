@@ -1,3 +1,4 @@
+{{- if not .Values.kv.enabled }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -19,6 +20,10 @@ spec:
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -106,3 +111,4 @@ spec:
           requests:
             storage: {{ $.Values.storage.size }}
     {{- end }}
+{{- end }}

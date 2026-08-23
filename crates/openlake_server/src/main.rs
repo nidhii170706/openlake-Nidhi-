@@ -1,40 +1,10 @@
-//! `openlaked` — thread-per-core S3 + RPC server.
-//!
-//! Terminology: a runtime here is one pinned OS thread owning one
-//! compio runtime on one CPU core. Runtimes do not own data — every
-//! runtime can write every drive. The word "runtime" means just
-//! "pinned execution context," not an ownership unit.
-//!
-//! Startup sequence:
-//!
-//!   1. Main thread parses config and picks `num_runtimes =
-//!      available_parallelism()` (one per logical CPU).
-//!   2. For each runtime `i` in `0..N`:
-//!      - Spawn an OS thread named `runtime-{i}`.
-//!      - Inside that thread, call `sched_setaffinity` to pin it
-//!        exclusively to CPU `i` (Linux; no-op elsewhere).
-//!      - Build a dedicated compio `Runtime` with `coop_taskrun`,
-//!        `thread_pool_limit(0)`, `event_interval(128)`.
-//!      - Block on `run_runtime(i, cfg)`.
-//!   3. `run_runtime` constructs this runtime's own `LocalFsBackend` +
-//!      `RemoteBackend`s + `Engine`, binds the S3 and RPC listeners
-//!      with `SO_REUSEPORT`, and runs both accept loops concurrently
-//!      as tasks on its own compio runtime.
-//!
-//! After startup: N pinned OS threads, N compio runtimes, N io_urings,
-//! N copies of the engine/backends. The kernel spreads incoming
-//! connections across runtimes via `SO_REUSEPORT` 4-tuple hashing —
-//! every new client lands on exactly one runtime's accept queue and
-//! stays on that runtime's thread for its whole life. Every connection
-//! handler, every engine call, every disk I/O for that client runs as
-//! a task on that runtime's compio scheduler.
-
 mod auth;
 mod config;
+mod hardware_inventory;
 mod in_memory_store;
-#[cfg(all(feature = "rdma", target_os = "linux"))]
-mod kv_slab;
+mod kv_runtime;
 mod lock_server;
+mod node_agent;
 #[cfg(all(feature = "rdma", target_os = "linux"))]
 mod rdma_server;
 mod rpc_server;
@@ -84,8 +54,12 @@ fn main() -> anyhow::Result<()> {
         let ord: u16 = s.parse()?;
         let toml_self_id = cfg.self_id;
         cfg.self_id = ord;
-        if let Some(rdma) = cfg.rdma.as_mut() {
-            rdma.self_node_id = ord;
+        if let Some(rdma) = cfg
+            .rdma
+            .as_mut()
+            .filter(|rdma| rdma.backend == config::RdmaBackend::Dct)
+        {
+            rdma.self_node_id = Some(ord);
         }
         tracing::warn!(
             env_self_id = ord,
@@ -98,42 +72,30 @@ fn main() -> anyhow::Result<()> {
 
     let cfg = Arc::new(cfg);
 
-    // Initialise the global buffer pool BEFORE any runtime spawns so
-    // every per-connection task sees a ready pool from the very first
-    // `PooledBuffer::with_capacity` call. Idempotent — repeat invocations
-    // are no-ops via `OnceCell::get_or_init`.
     openlake_io::MemoryPool::init_pool(&(&cfg.memory_pool).into());
     openlake_io::init_purge_worker();
 
     #[cfg(all(feature = "rdma", target_os = "linux"))]
-    if let Some(rdma_cfg) = cfg.rdma.as_ref() {
+    if let Some(rdma_cfg) = cfg
+        .rdma
+        .as_ref()
+        .filter(|rdma| rdma.backend == config::RdmaBackend::Dct)
+    {
         let to = std::time::Duration::from_secs(rdma_cfg.network_timeout_secs);
         openlake_io::rdma_backend::set_rdma_network_timeout(to);
     }
 
-    // One runtime per physical core. Hyperthread siblings are
-    // skipped so two runtimes never share a physical core's L1/L2.
-    let cpus = physical_cores().context("enumerate physical cores")?;
+    let mut cpus = physical_cores().context("enumerate physical cores")?;
+    if cfg.mode == config::Mode::Kv {
+        cpus.truncate(1);
+    }
     let num_runtimes = cpus.len();
     tracing::info!(num_runtimes, ?cpus, "spawning runtimes");
 
-    // One LockServer per node (process), shared across every runtime.
-    // The dsync write protocol requires a single source of truth for
-    // "who currently holds resource X" — having one map per runtime
-    // would let two runtimes grant the same lock to two different
-    // writers and silently break correctness.
     let lock_server = Arc::new(LockServer::new());
 
-    // Build TLS material once on the main thread. `TlsMaterial` is a
-    // `Clone`-cheap struct holding the three optional handles
-    // (s3_acceptor, rpc_acceptor, rpc_connector). Each runtime thread
-    // gets its own clone — under the hood that's just an Arc bump on
-    // the rustls configs.
     let tls = TlsMaterial::load(&cfg).context("loading TLS material")?;
 
-    // Each runtime reports its final exit status on this channel. The
-    // main thread drains it so a runtime panic or error is visible in
-    // logs instead of being swallowed by `JoinHandle`.
     let (done_tx, done_rx) = std::sync::mpsc::channel::<(usize, anyhow::Result<()>)>();
 
     let bootstrap_id: Arc<OnceLock<Uuid>> = Arc::new(OnceLock::new());
@@ -160,18 +122,49 @@ fn main() -> anyhow::Result<()> {
             .name(format!("runtime-{runtime_id}"))
             .spawn(move || {
                 let result = (|| -> anyhow::Result<()> {
-                    bind_cpu(cpu)?;
+                    if cfg.mode == config::Mode::Storage {
+                        bind_cpu(cpu)?;
+                    }
                     let rt = create_runtime()?;
-                    rt.block_on(run_runtime(
-                        runtime_id,
-                        num_runtimes,
-                        cfg,
-                        lock_server,
-                        tls,
-                        bootstrap_id,
-                        endpoint_registry,
-                        store,
-                    ))
+                    match cfg.mode {
+                        config::Mode::Kv => match cfg.transport {
+                            config::TransportMode::Rdma => {
+                                #[cfg(all(feature = "rdma", target_os = "linux"))]
+                                {
+                                    match cfg.rdma.as_ref().expect("validated: [rdma]").backend {
+                                        config::RdmaBackend::Dct => rt.block_on(kv_runtime::run(
+                                            cfg,
+                                            lock_server,
+                                            tls,
+                                            endpoint_registry,
+                                        )),
+                                        config::RdmaBackend::Ucx => {
+                                            rt.block_on(kv_runtime::run_ucx(cfg, lock_server, tls))
+                                        }
+                                    }
+                                }
+                                #[cfg(not(all(feature = "rdma", target_os = "linux")))]
+                                {
+                                    anyhow::bail!(
+                                        "kv rdma transport requires the rdma feature on linux"
+                                    )
+                                }
+                            }
+                            config::TransportMode::H2 => {
+                                rt.block_on(kv_runtime::run_tcp(cfg, lock_server, tls))
+                            }
+                        },
+                        config::Mode::Storage => rt.block_on(run_storage_runtime(
+                            runtime_id,
+                            num_runtimes,
+                            cfg,
+                            lock_server,
+                            tls,
+                            bootstrap_id,
+                            endpoint_registry,
+                            store,
+                        )),
+                    }
                 })();
                 if let Err(e) = &result {
                     tracing::error!(runtime_id, cpu, "runtime exited with error: {e:#}");
@@ -195,19 +188,6 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Enumerate the first logical CPU of each physical core on this
-/// machine, in ascending CPU-id order. Returns one CPU id per
-/// physical core — hyperthread siblings are filtered out so two
-/// runtimes never share a core's L1/L2.
-///
-/// On a host with 16 physical cores + SMT2, Linux sees 32 logical
-/// CPUs (0..31). We return 16 CPU ids, one from each physical
-/// core's sibling pair.
-///
-/// Linux: queries hwloc for real physical-core topology.
-/// Other platforms (macOS dev boxes): falls back to
-/// `available_parallelism`, which returns logical CPUs. Acceptable
-/// because production is Linux bare-metal.
 #[cfg(target_os = "linux")]
 fn physical_cores() -> anyhow::Result<Vec<usize>> {
     use hwlocality::object::types::ObjectType;
@@ -258,18 +238,6 @@ fn bind_cpu(cpu: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Build a compio runtime for a pinned
-/// runtime thread.
-///
-/// - `capacity(4096)` — io_uring SQ/CQ ring size.
-/// - `coop_taskrun(true) + taskrun_flag(true)` — kernel delivers CQEs
-///   on the submitter's task context, no IPI.
-/// - `thread_pool_limit(0)` (Linux only) — disables compio's
-///   `AsyncifyPool`, so no accidental worker thread can be spawned.
-///   macOS's compio fallback needs the pool for some fs ops, so we
-///   leave the default there.
-/// - `event_interval(128)` — cap task-poll bursts before re-checking
-///   I/O completions.
 fn create_runtime() -> anyhow::Result<compio::runtime::Runtime> {
     let mut proactor = compio::driver::ProactorBuilder::new();
     proactor
@@ -290,15 +258,8 @@ fn create_runtime() -> anyhow::Result<compio::runtime::Runtime> {
         .context("build compio runtime")
 }
 
-/// Per-runtime setup + event loop. Runs on one OS thread pinned to one
-/// CPU. Owns its own `LocalFsBackend`, its own `RemoteBackend`s, its
-/// own `Engine`, its own accept sockets (bound with `SO_REUSEPORT`),
-/// and every connection task spawned from those accept loops.
-///
-/// Returns only when both accept loops exit (normally: never, until
-/// shutdown).
 #[allow(clippy::too_many_arguments)]
-async fn run_runtime(
+async fn run_storage_runtime(
     runtime_id: usize,
     #[cfg_attr(
         not(all(feature = "rdma", target_os = "linux")),
@@ -312,29 +273,14 @@ async fn run_runtime(
     endpoint_registry: Arc<std::sync::Mutex<openlake_io::rpc::RdmaEndpointsReply>>,
     store: in_memory_store::InMemoryStore,
 ) -> anyhow::Result<()> {
-    // Extract the three TLS handles from the shared material.
-    //
-    // S3 acceptor / RPC acceptor go through `Rc` for runtime-local
-    // sharing: `TlsAcceptor` is a cheap `Arc<ServerConfig>` wrapper
-    // but `Rc` keeps per-connection refcount bumps non-atomic on the
-    // single-thread runtime.
-    //
-    // RPC connector is a bare `Arc<ClientConfig>` because cyper takes
-    // it directly via `ClientBuilder::use_rustls(Arc<ClientConfig>)`.
-    // No further wrapping is needed — clone the `Arc` per peer.
+    if runtime_id == 0 {
+        node_agent::spawn(cfg.clone(), tls.clone(), None, None)?;
+    }
+
     let s3_acceptor: Option<Rc<TlsAcceptor>> = tls.s3_acceptor().map(Rc::new);
     let rpc_acceptor: Option<Rc<TlsAcceptor>> = tls.rpc_acceptor().map(Rc::new);
     let rpc_connector: Option<Arc<ClientConfig>> = tls.rpc_connector();
 
-    // Each runtime opens its own handle to every local disk. The
-    // underlying filesystems are shared across the OS, the kernel
-    // serialises concurrent ops at the VFS layer. Per-runtime handles
-    // mean each runtime submits I/O to its own io_uring, keeping all
-    // kernel completion traffic on this runtime's core.
-    //
-    // `local_disks[i]` is the backend for `disk_idx = i` on this
-    // node. Order matches `cfg.data_dirs`, which on the wire is the
-    // disk_idx the cluster topology and other peers reference.
     let self_node = cfg
         .nodes
         .iter()
@@ -359,13 +305,6 @@ async fn run_runtime(
         .collect();
     debug_assert_eq!(local_disks.len(), self_node.disk_count as usize);
 
-    // Build storage backends keyed by `DiskAddr`, plus a per-node
-    // `LockPeer` indexed by `NodeId`. The lock plane is per-erasure-set
-    // (built below once the cluster topology is finalized), so we
-    // memoize one LockPeer per node here and assemble the per-set
-    // peer lists by `set_node_ids`. Per-peer `PeerClient` is shared
-    // across every `RemoteBackend` targeting the same peer so they
-    // ride a single multiplexed h2 connection.
     let mut backends: std::collections::HashMap<DiskAddr, Rc<dyn StorageBackend>> =
         std::collections::HashMap::with_capacity(
             cfg.nodes.iter().map(|n| n.disk_count as usize).sum(),
@@ -401,47 +340,27 @@ async fn run_runtime(
     }
 
     #[cfg(all(feature = "rdma", target_os = "linux"))]
-    let rdma_pending: Option<(
-        openlake_io::rdma::RdmaSetup,
-        openlake_io::rdma::RdmaConfig,
-        Option<Rc<kv_slab::KvSlab>>,
-    )> = match cfg.transport {
-        config::TransportMode::Rdma => {
-            let rdma_cfg = build_rdma_config(
-                cfg.rdma.as_ref().expect("rdma transport requires [rdma]"),
-                runtime_id as u16,
-                cfg.nodes.len() as u16,
-            );
-            let (setup, mut my_endpoint) =
-                openlake_io::rdma::RdmaNode::start_local(&rdma_cfg).context("rdma start_local")?;
-            let kv_slab = cfg
-                .kv_slab
-                .map(|s| -> anyhow::Result<Rc<kv_slab::KvSlab>> {
-                    Ok(Rc::new(kv_slab::KvSlab::new(
-                        setup.dev.clone(),
-                        s.slot_bytes,
-                        s.slot_count,
-                    )?))
-                })
-                .transpose()?;
-            if let Some(ref slab) = kv_slab {
-                my_endpoint.kv_slab = Some(openlake_io::rpc::SlabMeta {
-                    slab_base: slab.slab_base(),
-                    rkey: slab.rkey(),
-                    slot_bytes: slab.slot_bytes(),
-                });
-            }
-            {
-                let mut reg = endpoint_registry.lock().unwrap();
-                reg.endpoints.push(my_endpoint);
-                if reg.endpoints.len() >= num_runtimes {
-                    reg.complete = true;
+    let rdma_pending: Option<(openlake_io::rdma::RdmaSetup, openlake_io::rdma::RdmaConfig)> =
+        match cfg.transport {
+            config::TransportMode::Rdma => {
+                let rdma_cfg = build_rdma_config(
+                    cfg.rdma.as_ref().expect("rdma transport requires [rdma]"),
+                    runtime_id as u16,
+                    cfg.nodes.len() as u16,
+                )?;
+                let (setup, my_endpoint) = openlake_io::rdma::RdmaNode::start_local(&rdma_cfg)
+                    .context("rdma start_local")?;
+                {
+                    let mut reg = endpoint_registry.lock().unwrap();
+                    reg.endpoints.push(my_endpoint);
+                    if reg.endpoints.len() >= num_runtimes {
+                        reg.complete = true;
+                    }
                 }
+                Some((setup, rdma_cfg))
             }
-            Some((setup, rdma_cfg, kv_slab))
-        }
-        config::TransportMode::H2 => None,
-    };
+            config::TransportMode::H2 => None,
+        };
 
     let auth_state = Rc::new(auth::AuthState::new(cfg.region.clone(), &cfg.credentials));
 
@@ -476,6 +395,7 @@ async fn run_runtime(
             rpc_locks,
             rpc_acceptor_t,
             rpc_endpoints,
+            None,
         )
         .await
         {
@@ -484,11 +404,8 @@ async fn run_runtime(
     });
 
     #[cfg(all(feature = "rdma", target_os = "linux"))]
-    let mut rdma_kv_slab: Option<Rc<kv_slab::KvSlab>> = None;
-    #[cfg(all(feature = "rdma", target_os = "linux"))]
     let rdma_node: Option<Rc<openlake_io::rdma::RdmaNode>> =
-        if let Some((setup, rdma_cfg, kv_slab)) = rdma_pending {
-            rdma_kv_slab = kv_slab;
+        if let Some((setup, rdma_cfg)) = rdma_pending {
             let mut routing = openlake_io::rdma::ClusterRoutingTable::new(cfg.self_id);
             loop {
                 let reg = endpoint_registry.lock().unwrap();
@@ -584,10 +501,9 @@ async fn run_runtime(
             let local_disks = Rc::new(local_fs_disks.clone());
             let locks = lock_server.clone();
             let endpoints = endpoint_registry.clone();
-            let kv_slab = rdma_kv_slab.clone();
             Some(compio::runtime::spawn(async move {
                 if let Err(e) =
-                    rdma_server::serve(node, disks, local_disks, locks, endpoints, kv_slab).await
+                    rdma_server::serve(node, disks, local_disks, locks, endpoints, None).await
                 {
                     tracing::error!(runtime_id, "rdma serve error: {e:#}");
                 }
@@ -693,22 +609,31 @@ async fn run_runtime(
 }
 
 #[cfg(all(feature = "rdma", target_os = "linux"))]
-fn build_rdma_config(
+pub(crate) fn build_rdma_config(
     t: &config::RdmaToml,
     runtime_id: u16,
     num_cluster_nodes: u16,
-) -> openlake_io::rdma::RdmaConfig {
-    openlake_io::rdma::RdmaConfig {
-        self_node_id: t.self_node_id,
+) -> anyhow::Result<openlake_io::rdma::RdmaConfig> {
+    anyhow::ensure!(
+        t.backend == config::RdmaBackend::Dct,
+        "native RDMA configuration requires backend = \"dct\""
+    );
+    let qos = t.qos.as_ref().context("[rdma.qos] is required")?;
+    Ok(openlake_io::rdma::RdmaConfig {
+        self_node_id: t.self_node_id.context("[rdma] self_node_id is required")?,
         runtime_id,
-        dev_name: t.dev_name.clone(),
-        dc_key: t.dc_key,
+        dev_name: t.dev_name.clone().context("[rdma] dev_name is required")?,
+        dc_key: t.dc_key.context("[rdma] dc_key is required")?,
         qos: openlake_io::rdma::RdmaQos {
-            traffic_class: t.qos.traffic_class,
-            service_level: t.qos.service_level,
+            traffic_class: qos.traffic_class,
+            service_level: qos.service_level,
         },
         bulk_buf_size: openlake_storage::DEFAULT_EC_PER_SHARD_BYTES,
         bulk_pool_cap: t.bulk_pool_cap,
         num_cluster_nodes,
-    }
+        min_recv_bufs: 0,
+        srq_depth: t.srq_depth,
+        max_send_wr: t.max_send_wr,
+        peer_credit: t.peer_credit,
+    })
 }

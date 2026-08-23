@@ -1,0 +1,289 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "kv": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "transport",
+        "ports",
+        "slab",
+        "sharedMemory",
+        "targets",
+        "rdma",
+        "connector"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "transport": {
+          "type": "string",
+          "enum": ["h2", "rdma"]
+        },
+        "ports": {
+          "type": "object",
+          "required": ["rpc", "telemetry"],
+          "properties": {
+            "rpc": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "telemetry": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            }
+          }
+        },
+        "slab": {
+          "type": "object",
+          "required": ["capacityGB", "reserveTtlSeconds"],
+          "properties": {
+            "capacityGB": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "reserveTtlSeconds": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "sharedMemory": {
+          "type": "object",
+          "required": ["type", "hostPath"],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["emptyDir", "hostPath"]
+            },
+            "hostPath": {
+              "type": "string",
+              "pattern": "^/"
+            }
+          }
+        },
+        "targets": {
+          "type": "array",
+          "maxItems": 65536,
+          "items": {
+            "type": "object",
+            "required": ["nodeName", "ip"],
+            "properties": {
+              "nodeName": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 253,
+                "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
+              },
+              "ip": {
+                "type": "string",
+                "format": "ipv4"
+              }
+            }
+          }
+        },
+        "rdma": {
+          "type": "object",
+          "required": [
+            "backend",
+            "devName",
+            "dcKey",
+            "srqDepth",
+            "maxSendWr",
+            "peerCredit",
+            "maxClients",
+            "qos",
+            "env"
+          ],
+          "properties": {
+            "backend": {
+              "type": "string",
+              "enum": ["dct", "ucx"]
+            },
+            "devName": {
+              "type": "string"
+            },
+            "dcKey": {
+              "type": "string",
+              "pattern": "^(0[xX][0-9a-fA-F]+|[0-9]+)$"
+            },
+            "srqDepth": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "maxSendWr": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "peerCredit": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "maxClients": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "qos": {
+              "type": "object",
+              "required": ["trafficClass", "serviceLevel"],
+              "properties": {
+                "trafficClass": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 255
+                },
+                "serviceLevel": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 255
+                }
+              }
+            },
+            "env": {
+              "type": "object",
+              "propertyNames": {
+                "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+              },
+              "additionalProperties": {
+                "type": ["string", "number", "boolean"]
+              }
+            }
+          }
+        },
+        "connector": {
+          "type": "object",
+          "required": ["enabled", "device"],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "device": {
+              "type": "string"
+            }
+          }
+        },
+        "resources": {
+          "type": "object"
+        },
+        "tolerations": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "vllmSmokeTest": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "image",
+        "model",
+        "port",
+        "maxModelLen",
+        "startupTimeoutSeconds",
+        "hfTokenSecretName",
+        "env",
+        "resources"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "image": {
+          "type": "object",
+          "required": ["repository", "tag", "pullPolicy"],
+          "properties": {
+            "repository": {
+              "type": "string",
+              "minLength": 1
+            },
+            "tag": {
+              "type": "string",
+              "minLength": 1
+            },
+            "pullPolicy": {
+              "type": "string",
+              "enum": ["Always", "IfNotPresent", "Never"]
+            }
+          }
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "maxModelLen": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "startupTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 60
+        },
+        "hfTokenSecretName": {
+          "type": "string"
+        },
+        "env": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "additionalProperties": {
+            "type": ["string", "number", "boolean"]
+          }
+        },
+        "resources": {
+          "type": "object"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "kv": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "kv": {
+            "properties": {
+              "targets": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

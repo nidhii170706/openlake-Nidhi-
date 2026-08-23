@@ -111,6 +111,10 @@ pub struct Config {
     /// empty credential list so it cannot accidentally run open.
     pub credentials: Vec<Credential>,
     pub nodes: Vec<NodeAddr>,
+    /// Ordered KV-agent RPC endpoints used for peer discovery and telemetry.
+    /// KV engines remain standalone; this list does not create storage peers.
+    #[serde(default)]
+    pub kv_agents: Vec<SocketAddr>,
     /// Optional TLS for the customer-facing S3 listener. When absent
     /// the listener serves plaintext HTTP/1.1; when present it serves
     /// only HTTPS with the supplied cert chain + key.
@@ -136,7 +140,9 @@ pub struct Config {
     #[serde(default)]
     pub memory_pool: MemoryPoolToml,
     #[serde(default)]
-    pub transport: TransportMode, // h2 (default) | rdma
+    pub mode: Mode,
+    #[serde(default)]
+    pub transport: TransportMode,
     #[serde(default)]
     pub rdma: Option<RdmaToml>, // required when transport = rdma
     #[serde(default)]
@@ -145,8 +151,50 @@ pub struct Config {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct KvSlabToml {
-    pub slot_bytes: usize,
-    pub slot_count: usize,
+    #[serde(default)]
+    pub capacity_gb: Option<u64>,
+    #[serde(default)]
+    pub cpu_ram_frac: Option<f64>,
+    #[serde(default = "default_kv_reserve_ttl_secs")]
+    pub reserve_ttl_secs: u64,
+}
+
+impl KvSlabToml {
+    pub fn capacity_bytes(&self) -> anyhow::Result<u64> {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // cpu_ram_frac (fraction of system RAM, floored to whole GiB) wins over capacity_gb.
+        if let Some(frac) = self.cpu_ram_frac {
+            anyhow::ensure!(
+                frac > 0.0 && frac <= 1.0,
+                "[kv_slab] cpu_ram_frac must be in (0.0, 1.0], got {frac}"
+            );
+            let gb = (total_system_ram_bytes()? as f64 * frac) as u64 / GIB;
+            anyhow::ensure!(gb > 0, "[kv_slab] cpu_ram_frac {frac} yields under 1 GiB");
+            return Ok(gb * GIB);
+        }
+        let gb = self
+            .capacity_gb
+            .ok_or_else(|| anyhow::anyhow!("[kv_slab] set cpu_ram_frac or capacity_gb"))?;
+        Ok(gb * GIB)
+    }
+}
+
+fn default_kv_reserve_ttl_secs() -> u64 {
+    60
+}
+
+fn total_system_ram_bytes() -> anyhow::Result<u64> {
+    for line in std::fs::read_to_string("/proc/meminfo")?.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| anyhow::anyhow!("malformed MemTotal in /proc/meminfo"))?;
+            return Ok(kb * 1024);
+        }
+    }
+    anyhow::bail!("MemTotal not found in /proc/meminfo")
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -157,20 +205,58 @@ pub enum TransportMode {
     Rdma,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RdmaBackend {
+    #[default]
+    Dct,
+    Ucx,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    #[default]
+    Storage,
+    Kv,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RdmaToml {
-    pub self_node_id: u16,
-    pub dev_name: String,
-    pub dc_key: u64,
-    pub qos: RdmaQosToml,
+    #[serde(default)]
+    pub backend: RdmaBackend,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_node_id: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dev_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dc_key: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qos: Option<RdmaQosToml>,
     #[serde(default = "default_bulk_pool_cap")]
     pub bulk_pool_cap: usize,
     #[serde(default = "default_network_timeout_secs")]
     pub network_timeout_secs: u64,
+    #[serde(default = "default_srq_depth")]
+    pub srq_depth: u32,
+    #[serde(default = "default_max_send_wr")]
+    pub max_send_wr: u32,
+    #[serde(default = "default_peer_credit")]
+    pub peer_credit: u32,
+    pub max_clients: Option<u32>,
 }
 
 fn default_bulk_pool_cap() -> usize {
     64
+}
+fn default_srq_depth() -> u32 {
+    4096
+}
+fn default_max_send_wr() -> u32 {
+    256
+}
+fn default_peer_credit() -> u32 {
+    4
 }
 fn default_network_timeout_secs() -> u64 {
     10 * 60 * 60
@@ -249,7 +335,6 @@ fn deserialize_data_dirs<'de, D>(deserializer: D) -> Result<Vec<PathBuf>, D::Err
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de::Error;
     use serde::Deserialize as _;
 
     #[derive(Deserialize)]
@@ -261,13 +346,7 @@ where
 
     match OneOrMany::deserialize(deserializer)? {
         OneOrMany::One(p) => Ok(vec![p]),
-        OneOrMany::Many(v) => {
-            if v.is_empty() {
-                Err(D::Error::custom("data_dirs must contain at least one path"))
-            } else {
-                Ok(v)
-            }
-        }
+        OneOrMany::Many(v) => Ok(v),
     }
 }
 
@@ -279,67 +358,114 @@ impl Config {
             anyhow::bail!("self_id {} not present in nodes table", cfg.self_id);
         }
 
-        // Total disks across all nodes — sum of each node's disk_count.
-        let total_disks: usize = cfg.nodes.iter().map(|n| n.disk_count as usize).sum();
-        if total_disks == 0 {
-            anyhow::bail!("at least one node must declare disk_count >= 1");
-        }
-        if cfg.set_drive_count == 0 || cfg.set_drive_count > total_disks {
-            anyhow::bail!(
-                "set_drive_count must be in [1, {total_disks}] (total disks across cluster)"
-            );
-        }
-        if !total_disks.is_multiple_of(cfg.set_drive_count) {
-            anyhow::bail!(
-                "total disks ({total_disks}) must be a multiple of set_drive_count ({})",
-                cfg.set_drive_count,
-            );
-        }
-        // `default_parity_count` constraints: at least 1 (no
-        // redundancy is rejected — an unprotected cluster shouldn't
-        // boot by accident), at most `set_drive_count / 2` (the
-        // `P <= D` invariant Reed-Solomon decode requires).
-        if cfg.default_parity_count == 0 {
-            anyhow::bail!("default_parity_count must be >= 1; refusing to boot with no parity");
-        }
-        let max_parity = cfg.set_drive_count / 2;
-        if cfg.default_parity_count > max_parity {
-            anyhow::bail!(
-                "default_parity_count ({}) must be <= set_drive_count / 2 ({}); \
-                 Reed-Solomon requires P <= D",
-                cfg.default_parity_count,
-                max_parity,
-            );
-        }
-
-        // Local-node consistency: data_dirs.len() must equal this
-        // node's declared disk_count, and each path must be an
-        // existing directory.
-        let self_node = cfg
-            .nodes
-            .iter()
-            .find(|n| n.id == cfg.self_id)
-            .expect("self_id presence checked above");
-        if cfg.data_dirs.len() != self_node.disk_count as usize {
-            anyhow::bail!(
-                "data_dirs.len() ({}) must equal this node's disk_count ({})",
-                cfg.data_dirs.len(),
-                self_node.disk_count,
-            );
-        }
-        let mut seen: std::collections::HashSet<&PathBuf> = std::collections::HashSet::new();
-        for (i, p) in cfg.data_dirs.iter().enumerate() {
-            if !p.is_dir() {
+        if cfg.mode == Mode::Kv {
+            if cfg.kv_slab.is_none() {
+                anyhow::bail!("mode = \"kv\" requires a [kv_slab] block");
+            }
+            if cfg.nodes.len() != 1 {
+                anyhow::bail!("mode = \"kv\" nodes are standalone; list only this node");
+            }
+            if cfg.kv_agents.is_empty() {
+                anyhow::bail!("mode = \"kv\" requires a non-empty kv_agents list");
+            }
+            if cfg.kv_agents.len() > u16::MAX as usize + 1 {
                 anyhow::bail!(
-                    "data_dirs[{i}] = {} is not an existing directory",
-                    p.display(),
+                    "kv_agents contains more than {} addressable nodes",
+                    u16::MAX as usize + 1
                 );
             }
-            if !seen.insert(p) {
+            if cfg.self_id as usize >= cfg.kv_agents.len() {
                 anyhow::bail!(
-                    "data_dirs[{i}] = {} is duplicated; each disk needs a unique mountpoint",
-                    p.display(),
+                    "self_id {} is outside the ordered kv_agents list ({} entries)",
+                    cfg.self_id,
+                    cfg.kv_agents.len(),
                 );
+            }
+            let unique_agents = cfg
+                .kv_agents
+                .iter()
+                .collect::<std::collections::HashSet<_>>();
+            if unique_agents.len() != cfg.kv_agents.len() {
+                anyhow::bail!("kv_agents contains duplicate RPC endpoints");
+            }
+        } else if !cfg.kv_agents.is_empty() {
+            anyhow::bail!("kv_agents is only valid when mode = \"kv\"");
+        }
+        if let Some(r) = cfg.rdma.as_ref().filter(|r| r.backend == RdmaBackend::Dct) {
+            if r.self_node_id.is_none() {
+                anyhow::bail!("[rdma] self_node_id is required for backend = \"dct\"");
+            }
+            if r.dev_name.as_deref().is_none_or(str::is_empty) {
+                anyhow::bail!("[rdma] dev_name is required for backend = \"dct\"");
+            }
+            if r.dc_key.is_none() {
+                anyhow::bail!("[rdma] dc_key is required for backend = \"dct\"");
+            }
+            if r.qos.is_none() {
+                anyhow::bail!("[rdma.qos] is required for backend = \"dct\"");
+            }
+            if r.peer_credit == 0 {
+                anyhow::bail!("[rdma] peer_credit must be >= 1");
+            }
+            if r.max_clients.unwrap_or(0).saturating_mul(r.peer_credit + 1) > r.srq_depth {
+                anyhow::bail!("[rdma] max_clients x (peer_credit + 1) exceeds srq_depth");
+            }
+        }
+        if cfg.mode == Mode::Storage {
+            let total_disks: usize = cfg.nodes.iter().map(|n| n.disk_count as usize).sum();
+            if total_disks == 0 {
+                anyhow::bail!("at least one node must declare disk_count >= 1");
+            }
+            if cfg.set_drive_count == 0 || cfg.set_drive_count > total_disks {
+                anyhow::bail!(
+                    "set_drive_count must be in [1, {total_disks}] (total disks across cluster)"
+                );
+            }
+            if !total_disks.is_multiple_of(cfg.set_drive_count) {
+                anyhow::bail!(
+                    "total disks ({total_disks}) must be a multiple of set_drive_count ({})",
+                    cfg.set_drive_count,
+                );
+            }
+            if cfg.default_parity_count == 0 {
+                anyhow::bail!("default_parity_count must be >= 1; refusing to boot with no parity");
+            }
+            let max_parity = cfg.set_drive_count / 2;
+            if cfg.default_parity_count > max_parity {
+                anyhow::bail!(
+                    "default_parity_count ({}) must be <= set_drive_count / 2 ({}); \
+                 Reed-Solomon requires P <= D",
+                    cfg.default_parity_count,
+                    max_parity,
+                );
+            }
+
+            let self_node = cfg
+                .nodes
+                .iter()
+                .find(|n| n.id == cfg.self_id)
+                .expect("self_id presence checked above");
+            if cfg.data_dirs.len() != self_node.disk_count as usize {
+                anyhow::bail!(
+                    "data_dirs.len() ({}) must equal this node's disk_count ({})",
+                    cfg.data_dirs.len(),
+                    self_node.disk_count,
+                );
+            }
+            let mut seen: std::collections::HashSet<&PathBuf> = std::collections::HashSet::new();
+            for (i, p) in cfg.data_dirs.iter().enumerate() {
+                if !p.is_dir() {
+                    anyhow::bail!(
+                        "data_dirs[{i}] = {} is not an existing directory",
+                        p.display(),
+                    );
+                }
+                if !seen.insert(p) {
+                    anyhow::bail!(
+                        "data_dirs[{i}] = {} is duplicated; each disk needs a unique mountpoint",
+                        p.display(),
+                    );
+                }
             }
         }
 
@@ -391,10 +517,14 @@ impl Config {
             anyhow::bail!("transport = \"rdma\" requires an [rdma] config block");
         }
         if cfg.transport == TransportMode::Rdma {
+            let rdma = cfg.rdma.as_ref().expect("checked above");
             if !cfg!(all(feature = "rdma", target_os = "linux")) {
                 anyhow::bail!(
                     "transport = \"rdma\" requires the `rdma` cargo feature on a Linux build"
                 );
+            }
+            if rdma.backend == RdmaBackend::Ucx && cfg.mode != Mode::Kv {
+                anyhow::bail!("[rdma] backend = \"ucx\" currently supports mode = \"kv\" only");
             }
         }
         Ok(cfg)
@@ -414,4 +544,109 @@ fn validate_tls_files(t: &TlsConfig, label: &str) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod kv_slab_tests {
+    use super::*;
+
+    fn slab(capacity_gb: Option<u64>, cpu_ram_frac: Option<f64>) -> KvSlabToml {
+        KvSlabToml {
+            capacity_gb,
+            cpu_ram_frac,
+            reserve_ttl_secs: 60,
+        }
+    }
+
+    #[test]
+    fn frac_out_of_range_errors() {
+        assert!(slab(None, Some(0.0)).capacity_bytes().is_err());
+        assert!(slab(None, Some(1.5)).capacity_bytes().is_err());
+    }
+
+    #[test]
+    fn neither_set_errors() {
+        assert!(slab(None, None).capacity_bytes().is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn frac_wins_and_floors_to_whole_gib() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let bytes = slab(Some(1), Some(0.5)).capacity_bytes().unwrap();
+        assert_eq!(bytes % GIB, 0);
+        assert_eq!(
+            bytes,
+            (total_system_ram_bytes().unwrap() as f64 * 0.5) as u64 / GIB * GIB
+        );
+    }
+
+    #[test]
+    fn rdma_backend_defaults_to_dct() {
+        let rdma: RdmaToml = toml::from_str(
+            r#"
+self_node_id = 0
+dev_name = "mlx5_0"
+dc_key = 4919
+qos = { traffic_class = 0, service_level = 0 }
+"#,
+        )
+        .unwrap();
+        assert_eq!(rdma.backend, RdmaBackend::Dct);
+    }
+
+    #[test]
+    fn ucx_backend_does_not_require_dct_fields() {
+        let rdma: RdmaToml = toml::from_str("backend = \"ucx\"").unwrap();
+        assert_eq!(rdma.backend, RdmaBackend::Ucx);
+        assert!(rdma.dev_name.is_none());
+    }
+
+    #[test]
+    fn kv_mode_retains_the_ordered_agent_reference_list() {
+        let cfg = Config::from_toml(
+            r#"
+self_id = 1
+mode = "kv"
+rpc_addr = "0.0.0.0:9400"
+s3_addr = "0.0.0.0:9000"
+data_dirs = []
+set_drive_count = 1
+default_parity_count = 1
+region = "us-east-1"
+kv_agents = ["10.0.0.1:9400", "10.0.0.2:9400"]
+
+[[credentials]]
+access_key = "test"
+secret_key = "test"
+
+[[nodes]]
+id = 1
+rpc_addr = "0.0.0.0:9400"
+disk_count = 0
+
+[kv_slab]
+capacity_gb = 1
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.kv_agents[0], "10.0.0.1:9400".parse().unwrap());
+        assert_eq!(cfg.kv_agents[1], "10.0.0.2:9400".parse().unwrap());
+    }
+
+    #[test]
+    fn kv_mode_requires_an_agent_for_a_single_node() {
+        let text = include_str!("../configs/kv_local.toml");
+        let without_agents = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("kv_agents"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let error = Config::from_toml(&without_agents).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("mode = \"kv\" requires a non-empty kv_agents list"));
+    }
 }

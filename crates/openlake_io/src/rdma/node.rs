@@ -50,6 +50,10 @@ pub struct RdmaConfig {
     pub bulk_buf_size: usize,
     pub bulk_pool_cap: usize,
     pub num_cluster_nodes: u16,
+    pub min_recv_bufs: usize,
+    pub srq_depth: u32,
+    pub max_send_wr: u32,
+    pub peer_credit: u32,
 }
 
 pub struct RdmaSetup {
@@ -79,13 +83,18 @@ impl RdmaNode {
     pub fn start_local(cfg: &RdmaConfig) -> io::Result<(RdmaSetup, LocalEndpoint)> {
         let dev = Rc::new(IbDevice::open(&cfg.dev_name)?);
         let self_key = PeerKey::new(cfg.self_node_id, cfg.runtime_id);
-        let recv_buf_cnt = (super::buffers::SEND_BUF_CNT) * (cfg.num_cluster_nodes as usize);
+        let recv_buf_cnt = ((cfg.peer_credit as usize) * (cfg.num_cluster_nodes as usize))
+            .max(cfg.min_recv_bufs)
+            .min(cfg.srq_depth as usize);
         let sock = Rc::new(IbSocket::new(
             dev.clone(),
             cfg.dc_key,
             cfg.qos,
             self_key,
             recv_buf_cnt,
+            cfg.srq_depth,
+            cfg.max_send_wr,
+            cfg.peer_credit,
         )?);
         let ah_cache = Rc::new(AhCache::new(
             dev.clone(),

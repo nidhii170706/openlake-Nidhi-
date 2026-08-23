@@ -1,11 +1,12 @@
-//! `Router` construction and the per-runtime serve helper.
+//! ⁠ Router ⁠ construction and the per-runtime serve helper.
 //!
 //! The router is rebuilt per runtime so each one carries its own
-//! `AppState` (with `Rc<Engine>` / `Rc<AuthState>`). The
-//! `cyper_axum::serve` wrapper drives the connection accept loop on
+//! ⁠ AppState ⁠ (with ⁠ Rc<Engine> ⁠ / ⁠ Rc<AuthState> ⁠). The
+//! ⁠ cyper_axum::serve ⁠ wrapper drives the connection accept loop on
 //! the runtime's compio executor.
 
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -15,10 +16,9 @@ use axum::routing::{get, put};
 use axum::Router;
 use compio::net::TcpListener;
 use compio::tls::TlsAcceptor;
-use std::net::SocketAddr;
 
 use crate::config::Config;
-use crate::s3::error::{not_found, AppError};
+use crate::s3::error::not_found;
 use crate::s3::handlers::{buckets, in_memory_store, objects};
 use crate::s3::listener::TlsTcpListener;
 use crate::s3::middleware::sigv4::sigv4;
@@ -27,6 +27,8 @@ use crate::s3::state::AppState;
 pub fn build_router(state: AppState, cfg: Arc<Config>) -> Router {
     let admin_cfg = cfg.clone();
     let ping_cfg = cfg.clone();
+    let cluster_cfg = cfg.clone();
+
     let bucket_routes = put(buckets::put_bucket)
         .delete(buckets::delete_bucket)
         .head(buckets::head_bucket)
@@ -34,7 +36,7 @@ pub fn build_router(state: AppState, cfg: Arc<Config>) -> Router {
         .post(objects::delete_objects);
 
     Router::new()
-        .route("/", get(list_buckets_unimplemented))
+        .route("/", get(buckets::list_buckets))
         .route(
             "/openlake/admin/v1/config",
             get(move || {
@@ -47,6 +49,13 @@ pub fn build_router(state: AppState, cfg: Arc<Config>) -> Router {
             get(move || {
                 let cfg = ping_cfg.clone();
                 async move { serve_admin_ping(cfg).await }
+            }),
+        )
+        .route(
+            "/openlake/admin/v1/cluster/info",
+            get(move || {
+                let cfg = cluster_cfg.clone();
+                async move { serve_cluster_info(cfg).await }
             }),
         )
         .route("/{bucket}", bucket_routes.clone())
@@ -65,19 +74,20 @@ pub fn build_router(state: AppState, cfg: Arc<Config>) -> Router {
             "/openlake/cache/{*key}",
             get(in_memory_store::get).put(in_memory_store::put),
         )
+        .route(
+            "/openlake/admin/v1/metrics",
+            get(|| async { crate::s3::metrics::render() }),
+        )
+        .layer(axum::middleware::from_fn(crate::s3::metrics::meter))
         .layer(DefaultBodyLimit::disable())
         .with_state(state)
-}
-
-async fn list_buckets_unimplemented() -> Result<axum::http::Response<axum::body::Body>, AppError> {
-    Err(AppError::NotImplemented("ListBuckets is not implemented"))
 }
 
 async fn serve_admin_config(cfg: Arc<Config>) -> axum::Json<Config> {
     let mut c = (*cfg).clone();
     c.self_id = 0;
     if let Some(r) = c.rdma.as_mut() {
-        r.self_node_id = 0;
+        r.self_node_id = r.self_node_id.map(|_| 0);
     }
     for cr in &mut c.credentials {
         cr.secret_key = "***".into();
@@ -85,7 +95,7 @@ async fn serve_admin_config(cfg: Arc<Config>) -> axum::Json<Config> {
     axum::Json(c)
 }
 
-/// Liveness response for `GET /openlake/admin/v1/ping`. Served on the S3
+/// Liveness response for ⁠ GET /openlake/admin/v1/ping ⁠. Served on the S3
 /// listener (behind SigV4) so cluster tooling can check a node without
 /// touching the inter-node RPC plane.
 #[derive(serde::Serialize)]
@@ -98,6 +108,36 @@ async fn serve_admin_ping(cfg: Arc<Config>) -> axum::Json<Ping> {
     axum::Json(Ping {
         status: "ok",
         node_id: cfg.self_id,
+    })
+}
+
+#[derive(serde::Serialize)]
+struct ClusterNodeInfo {
+    id: u16,
+    rpc_addr: String,
+    disk_count: usize,
+}
+
+#[derive(serde::Serialize)]
+struct ClusterInfoResponse {
+    total_nodes: usize,
+    nodes: Vec<ClusterNodeInfo>,
+}
+
+async fn serve_cluster_info(cfg: Arc<Config>) -> axum::Json<ClusterInfoResponse> {
+    let nodes = cfg
+        .nodes
+        .iter()
+        .map(|n| ClusterNodeInfo {
+            id: n.id,
+            rpc_addr: n.rpc_addr.to_string(),
+            disk_count: n.disk_count as usize,
+        })
+        .collect();
+
+    axum::Json(ClusterInfoResponse {
+        total_nodes: cfg.nodes.len(),
+        nodes,
     })
 }
 
